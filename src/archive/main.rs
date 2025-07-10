@@ -10,6 +10,19 @@ use anyhow::{Result, Context};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::env;
 use std::sync::{Arc, Mutex};
+use clap::Parser;
+
+#[derive(Parser)]
+#[command(name = "git-history-exporter")]
+#[command(about = "Export and process Git history archives")]
+struct Args {
+    /// Timeframe to process (YYYY, YYYY-MM, or YYYY-MM-DD)
+    timeframe: String,
+    
+    /// ZSTD compression level (0-22, where 0 disables compression)
+    #[arg(long, default_value = "4", value_parser = clap::value_parser!(u8).range(0..=22))]
+    zstd_level: u8,
+}
 
 fn extract_type_and_repo(line: &str) -> Option<(&str, &str)> {
     // Find type first - it appears early in the line
@@ -145,9 +158,9 @@ fn parse_timeframe(timeframe: &str) -> Result<Vec<String>> {
     Ok(datetimes)
 }
 
-type FileWriters = Arc<Mutex<HashMap<String, BufWriter<Encoder<'static, File>>>>>;
+type FileWriters = Arc<Mutex<HashMap<String, Box<dyn Write + Send>>>>;
 
-fn get_or_create_writer(writers: &FileWriters, bucket_key: &str) -> Result<()> {
+fn get_or_create_writer(writers: &FileWriters, bucket_key: &str, zstd_level: u8) -> Result<()> {
     let mut writers_map = writers.lock().unwrap();
     
     if !writers_map.contains_key(bucket_key) {
@@ -165,15 +178,25 @@ fn get_or_create_writer(writers: &FileWriters, bucket_key: &str) -> Result<()> {
         let repo_dir = format!("work/archives-separated/{}", dir_parts.join("/"));
         create_dir_all(&repo_dir)?;
         
-        // Create file named after the month
-        let path = format!("{}/{}.jsonl.zstd", repo_dir, month);
+        // Create file with appropriate extension based on compression level
+        let path = if zstd_level == 0 {
+            format!("{}/{}.jsonl", repo_dir, month)
+        } else {
+            format!("{}/{}.jsonl.zstd", repo_dir, month)
+        };
+        
         let file = OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
             .open(path)?;
-        let encoder = Encoder::new(file, 4)?;
-        let writer = BufWriter::new(encoder);
+        
+        let writer: Box<dyn Write + Send> = if zstd_level == 0 {
+            Box::new(BufWriter::new(file))
+        } else {
+            let encoder = Encoder::new(file, zstd_level as i32)?;
+            Box::new(BufWriter::new(encoder))
+        };
         
         writers_map.insert(bucket_key.to_string(), writer);
     }
@@ -181,8 +204,8 @@ fn get_or_create_writer(writers: &FileWriters, bucket_key: &str) -> Result<()> {
     Ok(())
 }
 
-fn write_line_to_bucket(writers: &FileWriters, bucket_key: &str, line: &str) -> Result<()> {
-    get_or_create_writer(writers, bucket_key)?;
+fn write_line_to_bucket(writers: &FileWriters, bucket_key: &str, line: &str, zstd_level: u8) -> Result<()> {
+    get_or_create_writer(writers, bucket_key, zstd_level)?;
     
     let mut writers_map = writers.lock().unwrap();
     if let Some(writer) = writers_map.get_mut(bucket_key) {
@@ -192,7 +215,7 @@ fn write_line_to_bucket(writers: &FileWriters, bucket_key: &str, line: &str) -> 
     Ok(())
 }
 
-fn process_archive(datetime: &str, file_writers: FileWriters) -> Result<()> {
+fn process_archive(datetime: &str, file_writers: FileWriters, zstd_level: u8) -> Result<()> {
     let path = format!("work/archives/{}.json.gz", datetime);
 
     let file = File::open(&path).context(format!("Failed to open archive file from {}", path))?;
@@ -216,7 +239,7 @@ fn process_archive(datetime: &str, file_writers: FileWriters) -> Result<()> {
                 "PullRequestEvent" | "PushEvent" | "PullRequestReviewEvent" |
                 "PullRequestReviewCommentEvent" | "PullRequestReviewThreadEvent" => {
                     let bucket_key = get_bucket_key(repo_name, &month);
-                    write_line_to_bucket(&file_writers, &bucket_key, &line)?;
+                    write_line_to_bucket(&file_writers, &bucket_key, &line, zstd_level)?;
                 }
                 _ => {}
             }
@@ -252,18 +275,10 @@ fn flush_and_close_writers(writers: FileWriters) -> Result<()> {
 }
 
 fn main() -> Result<()> {
-    let args: Vec<String> = env::args().collect();
+    let args = Args::parse();
     
-    if args.len() != 2 {
-        eprintln!("Usage: {} <timeframe>", args[0]);
-        eprintln!("Examples:");
-        eprintln!("  {} 2021          # Process entire year 2021", args[0]);
-        eprintln!("  {} 2023-09       # Process September 2023", args[0]);
-        eprintln!("  {} 2024-06-05    # Process June 5, 2024", args[0]);
-        return Err(anyhow::anyhow!("Invalid arguments"));
-    }
-    
-    let timeframe = &args[1];
+    let timeframe = &args.timeframe;
+    let zstd_level = args.zstd_level;
     
     let datetimes = parse_timeframe(timeframe)?;
     
@@ -287,7 +302,7 @@ fn main() -> Result<()> {
     for datetime in datetimes {
         main_pb.set_message(format!("Processing {}", datetime));
         
-        match process_archive(&datetime, Arc::clone(&file_writers)) {
+        match process_archive(&datetime, Arc::clone(&file_writers), zstd_level) {
             Ok(_) => {
                 main_pb.println(format!("✓ Successfully processed {}", datetime));
             }
