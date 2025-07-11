@@ -57,10 +57,7 @@ fn parse_timeframe(timeframe: &str) -> Result<Vec<String>> {
     let parts: Vec<&str> = timeframe.split('-').collect();
     
     match parts.len() {
-        1 => {
-            // For year-only, use the year as prefix to match files like "2024-000000whatever"
-            Ok(vec![parts[0].to_string()])
-        },
+        1 => Ok(vec![parts[0].to_string()]),
         2 => Ok(vec![format!("{}-{}", parts[0], parts[1])]),
         3 => Ok(vec![format!("{}-{}", parts[0], parts[1])]),
         _ => Err(anyhow::anyhow!("Invalid timeframe format. Use YYYY, YYYY-MM, or YYYY-MM-DD")),
