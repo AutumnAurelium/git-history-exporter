@@ -2,15 +2,23 @@ mod gh;
 mod pr;
 
 use std::collections::HashMap;
-use std::fs::{File, create_dir_all, OpenOptions};
-use std::io::{BufRead, BufReader, BufWriter, Write};
-use flate2::read::GzDecoder;
-use zstd::Encoder;
+use std::fs::{File, create_dir_all};
+use std::path::Path;
+use std::sync::{Arc, Mutex};
 use anyhow::{Result, Context};
 use indicatif::{ProgressBar, ProgressStyle};
-use std::env;
-use std::sync::{Arc, Mutex};
 use clap::Parser;
+use parquet::file::reader::{FileReader, SerializedFileReader};
+use parquet::record::{Row, RowAccessor};
+use parquet::file::writer::SerializedFileWriter;
+use parquet::schema::parser::parse_message_type;
+use parquet::file::properties::WriterProperties;
+use parquet::basic::Compression;
+use parquet::schema::types::Type;
+use parquet::column::writer::ColumnWriter;
+use parquet::data_type::{ByteArray, Int64Type, ByteArrayType};
+use serde_json::Value;
+use chrono::{DateTime, Utc, Datelike};
 
 #[derive(Parser)]
 #[command(name = "git-history-exporter")]
@@ -18,259 +26,308 @@ use clap::Parser;
 struct Args {
     /// Timeframe to process (YYYY, YYYY-MM, or YYYY-MM-DD)
     timeframe: String,
-    
-    /// ZSTD compression level (0-22, where 0 disables compression)
-    #[arg(long, default_value = "4", value_parser = clap::value_parser!(u8).range(0..=22))]
-    zstd_level: u8,
 }
 
-fn extract_type_and_repo(line: &str) -> Option<(&str, &str)> {
-    // Find type first - it appears early in the line
-    let type_start = line.find(r#""type":""#)? + 8;
-    let type_end = line[type_start..].find('"')? + type_start;
-    let event_type = &line[type_start..type_end];
-    
-    // Then find repo
-    let repo_start = line.find(r#""repo":{"id":"#)?;
-    let name_start = line[repo_start..].find(r#","name":""#)? + repo_start + 9;
-    let name_end = line[name_start..].find('"')? + name_start;
-    let repo = &line[name_start..name_end];
-    
-    Some((event_type, repo))
-}
-
-fn extract_month_from_datetime(datetime: &str) -> Result<String> {
-    // Extract YYYY-MM from datetime format YYYY-MM-DD-HH
-    let parts: Vec<&str> = datetime.split('-').collect();
-    if parts.len() < 2 {
-        return Err(anyhow::anyhow!("Invalid datetime format"));
-    }
-    Ok(format!("{}-{}", parts[0], parts[1]))
+fn extract_month_from_created_at(created_at_millis: i64) -> Result<String> {
+    // Simple conversion - just extract year-month from timestamp
+    let dt = std::time::UNIX_EPOCH + std::time::Duration::from_millis(created_at_millis as u64);
+    let datetime = chrono::DateTime::<chrono::Utc>::from(dt);
+    Ok(format!("{:04}-{:02}", datetime.year(), datetime.month()))
 }
 
 fn get_bucket_key(repo_name: &str, month: &str) -> String {
-    // Get first 3 characters of repo name (handle case where repo name is shorter)
     let repo_prefix = if repo_name.len() >= 3 {
         &repo_name[..3]
     } else {
         repo_name
     };
     
-    // Replace slashes with underscores to avoid invalid bucket key format
     let safe_repo_prefix = repo_prefix.replace('/', "_");
     
-    // Create branching structure: each character becomes a directory level
     let mut path_parts = Vec::new();
     for ch in safe_repo_prefix.chars() {
         path_parts.push(ch.to_string());
     }
     
-    // Join with month at the end
     path_parts.push(month.to_string());
     path_parts.join("/")
 }
 
 fn parse_timeframe(timeframe: &str) -> Result<Vec<String>> {
     let parts: Vec<&str> = timeframe.split('-').collect();
-    let mut datetimes = Vec::new();
     
     match parts.len() {
         1 => {
-            // Year format: "2021"
-            let year: i32 = parts[0].parse()
-                .context("Invalid year format")?;
-            
-            // Generate all hours for the entire year
+            // For year-only, generate all month patterns for that year
+            let year = parts[0];
+            let mut patterns = Vec::new();
             for month in 1..=12 {
-                let days_in_month = match month {
-                    1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-                    4 | 6 | 9 | 11 => 30,
-                    2 => if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) { 29 } else { 28 },
-                    _ => return Err(anyhow::anyhow!("Invalid month")),
-                };
-                
-                for day in 1..=days_in_month {
-                    for hour in 0..24 {
-                        datetimes.push(format!("{:04}-{:02}-{:02}-{}", year, month, day, hour));
-                    }
-                }
+                patterns.push(format!("{}-{:02}", year, month));
             }
+            Ok(patterns)
         },
-        2 => {
-            // Month format: "2023-09"
-            let year: i32 = parts[0].parse()
-                .context("Invalid year in month format")?;
-            let month: u32 = parts[1].parse()
-                .context("Invalid month")?;
+        2 => Ok(vec![format!("{}-{}", parts[0], parts[1])]),
+        3 => Ok(vec![format!("{}-{}", parts[0], parts[1])]),
+        _ => Err(anyhow::anyhow!("Invalid timeframe format. Use YYYY, YYYY-MM, or YYYY-MM-DD")),
+    }
+}
+
+fn find_parquet_files(timeframe_patterns: &[String]) -> Result<Vec<String>> {
+    let mut files = Vec::new();
+    
+    for pattern in timeframe_patterns {
+        let dir_path = Path::new("work/archives-bq");
+        if !dir_path.exists() {
+            return Err(anyhow::anyhow!("Directory work/archives-bq does not exist"));
+        }
+        
+        for entry in std::fs::read_dir(dir_path)? {
+            let entry = entry?;
+            let file_name = entry.file_name();
+            let file_name_str = file_name.to_string_lossy();
             
-            if month < 1 || month > 12 {
-                return Err(anyhow::anyhow!("Month must be between 1 and 12"));
+            if file_name_str.starts_with(pattern) && file_name_str.ends_with(".parquet.zst") {
+                files.push(entry.path().to_string_lossy().to_string());
             }
-            
-            let days_in_month = match month {
-                1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-                4 | 6 | 9 | 11 => 30,
-                2 => if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) { 29 } else { 28 },
-                _ => return Err(anyhow::anyhow!("Invalid month")),
-            };
-            
-            // Generate all hours for the entire month
-            for day in 1..=days_in_month {
-                for hour in 0..24 {
-                    datetimes.push(format!("{:04}-{:02}-{:02}-{}", year, month, day, hour));
-                }
-            }
-        },
-        3 => {
-            // Day format: "2024-06-05"
-            let year: i32 = parts[0].parse()
-                .context("Invalid year in day format")?;
-            let month: u32 = parts[1].parse()
-                .context("Invalid month in day format")?;
-            let day: u32 = parts[2].parse()
-                .context("Invalid day")?;
-            
-            if month < 1 || month > 12 {
-                return Err(anyhow::anyhow!("Month must be between 1 and 12"));
-            }
-            
-            let days_in_month = match month {
-                1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-                4 | 6 | 9 | 11 => 30,
-                2 => if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) { 29 } else { 28 },
-                _ => return Err(anyhow::anyhow!("Invalid month")),
-            };
-            
-            if day < 1 || day > days_in_month {
-                return Err(anyhow::anyhow!("Day must be between 1 and {}", days_in_month));
-            }
-            
-            // Generate all hours for the single day
-            for hour in 0..24 {
-                datetimes.push(format!("{:04}-{:02}-{:02}-{}", year, month, day, hour));
-            }
-        },
-        _ => {
-            return Err(anyhow::anyhow!("Invalid timeframe format. Use YYYY, YYYY-MM, or YYYY-MM-DD"));
         }
     }
     
-    Ok(datetimes)
+    files.sort();
+    Ok(files)
 }
 
-type FileWriters = Arc<Mutex<HashMap<String, Box<dyn Write + Send>>>>;
+#[derive(Debug)]
+struct RowBuffer {
+    event_types: Vec<String>,
+    payloads: Vec<String>,
+    repo_names: Vec<String>,
+    created_ats: Vec<i64>,
+}
 
-fn get_or_create_writer(writers: &FileWriters, bucket_key: &str, zstd_level: u8) -> Result<()> {
+impl RowBuffer {
+    fn new() -> Self {
+        Self {
+            event_types: Vec::new(),
+            payloads: Vec::new(),
+            repo_names: Vec::new(),
+            created_ats: Vec::new(),
+        }
+    }
+    
+    fn add_row(&mut self, event_type: String, payload: String, repo_name: String, created_at: i64) {
+        self.event_types.push(event_type);
+        self.payloads.push(payload);
+        self.repo_names.push(repo_name);
+        self.created_ats.push(created_at);
+    }
+    
+    fn len(&self) -> usize {
+        self.event_types.len()
+    }
+    
+    fn clear(&mut self) {
+        self.event_types.clear();
+        self.payloads.clear();
+        self.repo_names.clear();
+        self.created_ats.clear();
+    }
+}
+
+type ParquetWriters = Arc<Mutex<HashMap<String, (SerializedFileWriter<File>, RowBuffer)>>>;
+
+fn get_or_create_parquet_writer(writers: &ParquetWriters, bucket_key: &str) -> Result<()> {
     let mut writers_map = writers.lock().unwrap();
     
     if !writers_map.contains_key(bucket_key) {
-        // Extract directory and filename from bucket_key (format: "char1/char2/char3/YYYY-MM")
         let parts: Vec<&str> = bucket_key.split('/').collect();
         if parts.len() < 2 {
-            return Err(anyhow::anyhow!("Invalid bucket key format: '{}' (expected at least 'char/YYYY-MM', got {} parts)", bucket_key, parts.len()));
+            return Err(anyhow::anyhow!("Invalid bucket key format: '{}'", bucket_key));
         }
         
-        // All parts except the last one form the directory path
         let dir_parts = &parts[..parts.len()-1];
         let month = parts[parts.len()-1];
         
-        // Create nested directory structure
         let repo_dir = format!("work/archives-separated/{}", dir_parts.join("/"));
         create_dir_all(&repo_dir)?;
         
-        // Create file with appropriate extension based on compression level
-        let path = if zstd_level == 0 {
-            format!("{}/{}.jsonl", repo_dir, month)
-        } else {
-            format!("{}/{}.jsonl.zstd", repo_dir, month)
-        };
+        let path = format!("{}/{}.parquet", repo_dir, month);
         
-        let file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(path)?;
+        let file = File::create(&path)?;
+
+        let schema = Arc::new(parse_message_type(OUTPUT_SCHEMA)?);
         
-        let writer: Box<dyn Write + Send> = if zstd_level == 0 {
-            Box::new(BufWriter::new(file))
-        } else {
-            let encoder = Encoder::new(file, zstd_level as i32)?;
-            Box::new(BufWriter::new(encoder))
-        };
+        let props = WriterProperties::builder()
+            .set_compression(Compression::ZSTD(Default::default()))
+            .build();
         
-        writers_map.insert(bucket_key.to_string(), writer);
+        let writer = SerializedFileWriter::new(file, schema, Arc::new(props))?;
+        let buffer = RowBuffer::new();
+        writers_map.insert(bucket_key.to_string(), (writer, buffer));
     }
     
     Ok(())
 }
 
-fn write_line_to_bucket(writers: &FileWriters, bucket_key: &str, line: &str, zstd_level: u8) -> Result<()> {
-    get_or_create_writer(writers, bucket_key, zstd_level)?;
+fn extract_data_from_parquet_row(row: &Row) -> Result<Option<(String, String, String, i64)>> {
+    // Extract event type
+    let event_type = row.get_string(0)?.to_string();
+
+    let repo_group = row.get_group(3)?;
+    let repo_name = repo_group.get_string(1)?.to_string();
+
+    let payload = row.get_string(2)?.to_string();
     
-    let mut writers_map = writers.lock().unwrap();
-    if let Some(writer) = writers_map.get_mut(bucket_key) {
-        writeln!(writer, "{}", line)?;
-    }
+    // Extract created_at timestamp
+    let created_timestamp = row.get_timestamp_micros(6)? / 1000;
     
-    Ok(())
+    Ok(Some((event_type, repo_name, payload, created_timestamp)))
 }
 
-fn process_archive(datetime: &str, file_writers: FileWriters, zstd_level: u8) -> Result<()> {
-    let path = format!("work/archives/{}.json.gz", datetime);
+const OUTPUT_SCHEMA: &str = r#"
+message schema {
+  REQUIRED BYTE_ARRAY type (STRING);
+  REQUIRED BYTE_ARRAY payload (STRING);
+  REQUIRED BYTE_ARRAY repo_name (STRING);
+  REQUIRED INT64 created_at;
+}
+"#;
 
-    let file = File::open(&path).context(format!("Failed to open archive file from {}", path))?;
-
+fn process_parquet_file(file_path: &str, parquet_writers: ParquetWriters) -> Result<()> {
+    let file = File::open(file_path)
+        .context(format!("Failed to open parquet file: {}", file_path))?;
+    
+    let reader = SerializedFileReader::new(file)?;
+    
     let spinner = ProgressBar::new_spinner();
-    spinner.set_message(format!("Processing {}", datetime));
-    spinner.set_style(ProgressStyle::default_spinner().template("{spinner:.green} {msg} [{elapsed_precise}] {human_pos} completed ({per_sec})")?);
-        
-    // Extract month from datetime for bucketing
-    let month = extract_month_from_datetime(datetime)?;
+    spinner.set_message(format!("Processing {}", Path::new(file_path).file_name().unwrap().to_string_lossy()));
+    spinner.set_style(ProgressStyle::default_spinner()
+        .template("{spinner:.green} {msg} [{elapsed_precise}] {human_pos} rows processed ({per_sec})")?);
     
-    // Decompress the gzipped content
-    let decoder = GzDecoder::new(file);
-    
-    let reader = BufReader::new(decoder);
+    let mut row_iter = reader.get_row_iter(None)?;
 
-    for line in reader.lines() {
-        let line = line?;
-        if let Some((event_type, repo_name)) = extract_type_and_repo(&line) {
-            match event_type {
-                "PullRequestEvent" | "PushEvent" | "PullRequestReviewEvent" |
-                "PullRequestReviewCommentEvent" | "PullRequestReviewThreadEvent" => {
-                    let bucket_key = get_bucket_key(repo_name, &month);
-                    write_line_to_bucket(&file_writers, &bucket_key, &line, zstd_level)?;
-                }
-                _ => {}
-            }
+    let schema = reader.metadata().file_metadata().schema();
+    
+    while let Some(row) = row_iter.next() {
+        let row = row?;
+        
+        // Extract data directly from parquet row without JSON conversion
+        if let Some((event_type, repo_name, payload, created_at)) = extract_data_from_parquet_row(&row)? {
+            let month = extract_month_from_created_at(created_at)?;
+            let bucket_key = get_bucket_key(&repo_name, &month);
+            
+            // Pass the original row directly instead of converting to JSON
+            write_row_to_parquet(&parquet_writers, &bucket_key, &row)?;
+        } else {
+            println!("No data found in row");
         }
+        
         spinner.inc(1);
     }
     
     spinner.finish();
-
     Ok(())
 }
 
-fn flush_and_close_writers(writers: FileWriters) -> Result<()> {
+fn write_row_to_parquet(writers: &ParquetWriters, bucket_key: &str, row: &Row) -> Result<()> {
+    get_or_create_parquet_writer(writers, bucket_key)?;
+    
+    // Extract the data we need from the row
+    let (event_type, repo_name, payload, created_at) = extract_data_from_parquet_row(row)?.unwrap();
+    
+    // Add to buffer
+    {
+        let mut writers_map = writers.lock().unwrap();
+        let (_, buffer) = writers_map.get_mut(bucket_key).unwrap();
+        buffer.add_row(event_type, payload, repo_name, created_at);
+        
+        // Write batch when buffer reaches threshold
+        if buffer.len() >= 1000 {
+            flush_buffer_to_parquet(&mut writers_map.get_mut(bucket_key).unwrap())?;
+        }
+    }
+    
+    Ok(())
+}
+
+fn flush_buffer_to_parquet((writer, buffer): &mut (SerializedFileWriter<File>, RowBuffer)) -> Result<()> {
+    if buffer.len() == 0 {
+        return Ok(());
+    }
+    
+    let mut row_group_writer = writer.next_row_group()?;
+    
+    // Write event_type column (type)
+    {
+        let mut col_writer = row_group_writer.next_column()?.unwrap();
+        let values: Vec<parquet::data_type::ByteArray> = buffer.event_types.iter()
+            .map(|s| parquet::data_type::ByteArray::from(s.as_bytes()))
+            .collect();
+        col_writer.typed::<parquet::data_type::ByteArrayType>()
+            .write_batch(&values, None, None)?;
+        col_writer.close()?;
+    }
+    
+    // Write payload column  
+    {
+        let mut col_writer = row_group_writer.next_column()?.unwrap();
+        let values: Vec<parquet::data_type::ByteArray> = buffer.payloads.iter()
+            .map(|s| parquet::data_type::ByteArray::from(s.as_bytes()))
+            .collect();
+        col_writer.typed::<parquet::data_type::ByteArrayType>()
+            .write_batch(&values, None, None)?;
+        col_writer.close()?;
+    }
+    
+    // Write repo name column
+    {
+        let mut col_writer = row_group_writer.next_column()?.unwrap();
+        let values: Vec<parquet::data_type::ByteArray> = buffer.repo_names.iter()
+            .map(|s| parquet::data_type::ByteArray::from(s.as_bytes()))
+            .collect();
+        col_writer.typed::<parquet::data_type::ByteArrayType>()
+            .write_batch(&values, None, None)?;
+        col_writer.close()?;
+    }
+    
+    // Write created_at column
+    {
+        let mut col_writer = row_group_writer.next_column()?.unwrap();
+        col_writer.typed::<parquet::data_type::Int64Type>()
+            .write_batch(&buffer.created_ats, None, None)?;
+        col_writer.close()?;
+    }
+    
+    row_group_writer.close()?;
+    buffer.clear();
+    
+    Ok(())
+}
+
+fn finalize_parquet_writers(writers: ParquetWriters) -> Result<()> {
     let writers_map = Arc::try_unwrap(writers)
         .map_err(|_| anyhow::anyhow!("Failed to extract writers"))?
         .into_inner()
         .unwrap();
     
     let spinner = ProgressBar::new(writers_map.len() as u64);
-    spinner.set_message("Flushing and closing files");
+    spinner.set_message("Finalizing parquet files");
     spinner.set_style(ProgressStyle::default_bar()
         .template("[{elapsed_precise}] {bar:40.cyan/blue} {pos:>3}/{len:3} {msg}")
         .unwrap()
         .progress_chars("##-"));
     
-    for (bucket_key, mut writer) in writers_map {
-        writer.flush().context(format!("Failed to flush writer for {}", bucket_key))?;
+    for (bucket_key, mut writer_buffer) in writers_map {
+        // Flush any remaining data in the buffer
+        if writer_buffer.1.len() > 0 {
+            flush_buffer_to_parquet(&mut writer_buffer)?;
+        }
+        // Ensure the writer is properly closed
+        let writer = writer_buffer.0;
+        writer.close()?;
         spinner.inc(1);
     }
     
-    spinner.finish_with_message("All files flushed and closed");
+    spinner.finish_with_message("All parquet files finalized");
     Ok(())
 }
 
@@ -278,47 +335,48 @@ fn main() -> Result<()> {
     let args = Args::parse();
     
     let timeframe = &args.timeframe;
-    let zstd_level = args.zstd_level;
     
-    let datetimes = parse_timeframe(timeframe)?;
+    let timeframe_patterns = parse_timeframe(timeframe)?;
+    let parquet_files = find_parquet_files(&timeframe_patterns)?;
     
-    // Create the separated directory if it doesn't exist
+    if parquet_files.is_empty() {
+        return Err(anyhow::anyhow!("No parquet files found for timeframe: {}", timeframe));
+    }
+    
     create_dir_all("work/archives-separated")?;
     
-    println!("Processing {} archive files for timeframe: {}", datetimes.len(), timeframe);
+    println!("Processing {} parquet files for timeframe: {}", parquet_files.len(), timeframe);
     
-    let main_pb = ProgressBar::new(datetimes.len() as u64);
+    let main_pb = ProgressBar::new(parquet_files.len() as u64);
     main_pb.set_style(
         ProgressStyle::default_bar()
             .template("[{elapsed_precise}/{duration_precise}] {bar:40.cyan/blue} {pos:>3}/{len:3} {msg}")
             .unwrap()
             .progress_chars("##-")
     );
-    main_pb.set_message("Processing archives");
+    main_pb.set_message("Processing parquet files");
     
-    // Shared file writers for all buckets
-    let file_writers: FileWriters = Arc::new(Mutex::new(HashMap::new()));
+    let parquet_writers: ParquetWriters = Arc::new(Mutex::new(HashMap::new()));
     
-    for datetime in datetimes {
-        main_pb.set_message(format!("Processing {}", datetime));
+    for file_path in &parquet_files {
+        main_pb.set_message(format!("Processing {}", Path::new(&file_path).file_name().unwrap().to_string_lossy()));
         
-        match process_archive(&datetime, Arc::clone(&file_writers), zstd_level) {
+        match process_parquet_file(&file_path, Arc::clone(&parquet_writers)) {
             Ok(_) => {
-                main_pb.println(format!("✓ Successfully processed {}", datetime));
+                main_pb.println(format!("✓ Successfully processed {}", file_path));
             }
             Err(e) => {
-                main_pb.println(format!("✗ Failed to process {}: {}", datetime, e));
+                main_pb.println(format!("✗ Failed to process {}: {}", file_path, e));
             }
         }
         
         main_pb.inc(1);
     }
     
-    main_pb.finish_with_message("All archives processed");
+    main_pb.finish_with_message("All parquet files processed");
     
-    // Flush and close all file writers
-    println!("Flushing and closing files...");
-    flush_and_close_writers(file_writers)?;
+    println!("Finalizing parquet files...");
+    finalize_parquet_writers(parquet_writers)?;
     
     println!("✓ All processing complete!");
     

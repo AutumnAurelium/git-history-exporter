@@ -14,6 +14,8 @@ reqwest = { version = "0.11", features = ["blocking"] }
 flate2 = { version = "1.0", features = ["zlib-ng"], default-features = false }
 rayon = "1.8.1"
 zstd = "0.13.3"
+parquet = "55.2.0"
+chrono = "0.4"
 
 [[bin]]
 name = "history"
