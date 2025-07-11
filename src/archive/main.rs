@@ -58,13 +58,8 @@ fn parse_timeframe(timeframe: &str) -> Result<Vec<String>> {
     
     match parts.len() {
         1 => {
-            // For year-only, generate all month patterns for that year
-            let year = parts[0];
-            let mut patterns = Vec::new();
-            for month in 1..=12 {
-                patterns.push(format!("{}-{:02}", year, month));
-            }
-            Ok(patterns)
+            // For year-only, use the year as prefix to match files like "2024-000000whatever"
+            Ok(vec![parts[0].to_string()])
         },
         2 => Ok(vec![format!("{}-{}", parts[0], parts[1])]),
         3 => Ok(vec![format!("{}-{}", parts[0], parts[1])]),
